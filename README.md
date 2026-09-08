@@ -10,6 +10,18 @@ python3 -m venv .venv
 cp .env.example .env   # then add your OPENAI_API_KEY
 ```
 
+The database tools need a running PostgreSQL server. On macOS:
+
+```bash
+brew install postgresql@17
+brew services start postgresql@17
+.venv/bin/python -m app.db      # creates the database, tables and sample rows
+```
+
+That last command is optional — the tools run it themselves on first use. The
+default connection URL is `postgresql://localhost/langgraph_demo`; set
+`DATABASE_URL` in `.env` to point at a different server.
+
 `.env` is loaded automatically on import (see [app/__init__.py](app/__init__.py)),
 so there is no need to `export` anything.
 
@@ -26,7 +38,7 @@ so there is no need to `export` anything.
 |---|---|
 | [app/state.py](app/state.py) | `AgentState` — the state passed between nodes |
 | [app/tools.py](app/tools.py) | Tool definitions — calculator, web search, database |
-| [app/db.py](app/db.py) | The sample SQLite database the database tools read |
+| [app/db.py](app/db.py) | PostgreSQL connection + the sample schema and rows |
 | [app/graph.py](app/graph.py) | Graph wiring and the compiled `graph` object |
 | [app/main.py](app/main.py) | CLI entry point |
 | [app/examples/](app/examples/) | Standalone graph examples (no API key needed) |
@@ -44,8 +56,8 @@ it** — so the docstring is part of the program, not just a comment.
 | `calculator` | `expression` | Arithmetic: `+ - * / ** %` and parentheses |
 | `word_count` | `text` | Word and character count |
 | `web_search` | `query`, `max_results` | DuckDuckGo search — no API key needed |
-| `database_schema` | — | Lists the tables and columns |
-| `database_query` | `sql` | Runs a read-only `SELECT` |
+| `database_schema` | — | Lists the tables, columns and foreign keys |
+| `database_query` | `sql` | Runs a read-only `SELECT` against PostgreSQL |
 
 Every tool returns a **string** (the result is fed back to the model as text)
 and never raises — each one catches its own errors and returns a readable
@@ -93,11 +105,31 @@ tool would force it to guess. Splitting a job into a *discovery* step and an
 *action* step is a pattern worth reusing for any tool that touches a system the
 model cannot see.
 
-The data lives in [app/db.py](app/db.py) — three tables (`customers`,
-`products`, `orders`) in a single SQLite file at `data/demo.db`. SQLite is in
-Python's standard library, so there is nothing to install and no server to run.
-The file is created and seeded the first time a tool opens it; delete it and it
-is rebuilt.
+The data lives in [app/db.py](app/db.py): three tables (`customers`, `products`,
+`orders`) in a PostgreSQL database named `langgraph_demo`. Postgres is a
+**server**, not a file — it runs as its own process and you reach it over a
+connection URL:
+
+```
+postgresql://user:password@host:port/database_name
+postgresql://localhost/langgraph_demo      <- the default here
+```
+
+`ensure_database()` creates the database, the tables and the sample rows if they
+are missing, and every step checks first, so it is safe to re-run. It is called
+automatically the first time a tool opens a connection, or by hand with
+`python -m app.db`.
+
+Two Postgres details the code calls out, because they trip people up:
+
+- **`CREATE DATABASE` cannot run inside a transaction.** psycopg opens one for
+  you by default, so that one connection is made with `autocommit=True`.
+- **Placeholders are `%s`, not `?`** (SQLite's style), and they only work for
+  *values*. Table and database names need `psycopg.sql.Identifier` instead.
+  Either way the rule is the same: never build SQL with f-strings.
+
+Money is stored as `NUMERIC(10, 2)`, not a float. Binary floating point cannot
+represent `0.1` exactly, and those errors accumulate over a `SUM()`.
 
 **Safety has two layers**, which is worth understanding because the SQL is
 written by a language model:
@@ -105,20 +137,30 @@ written by a language model:
 1. `database_query` rejects anything not starting with `SELECT`/`WITH`, and
    rejects a `;` inside the query so a second statement cannot be smuggled in.
    This layer exists to give a *clear error message*.
-2. The connection is opened as `file:demo.db?mode=ro`, which makes SQLite itself
-   refuse every write. This layer is the *actual guarantee* — a `DELETE` that
-   somehow got past step 1 still fails here.
+2. The connection sets `read_only = True`, so **Postgres itself** refuses every
+   write. This layer is the *actual guarantee*. A data-modifying CTE such as
+   `WITH gone AS (DELETE FROM orders RETURNING *) SELECT * FROM gone` starts
+   with `WITH` and sails past layer 1 — the server still rejects it:
 
-Results are capped at 50 rows and rendered as an aligned text table:
+   ```
+   Error running query: cannot execute SELECT in a read-only transaction
+   ```
+
+   In production you would go one step further and connect as a role that was
+   only ever `GRANT`ed `SELECT`.
+
+A `statement_timeout` of 10 seconds is set on the connection, so an accidentally
+expensive query is aborted by the server rather than hanging the agent. Results
+are capped at 50 rows and rendered as an aligned text table:
 
 ```
 .venv/bin/python -m app.main "who spent the most, and on what?"
 
-name              | spent
-------------------+-------
-Linus Torvalds    | 878.98
-Alan Turing       | 734.75
-Ada Lovelace      | 697.49
+name              | city     | spent
+------------------+----------+-------
+Linus Torvalds    | Portland | 878.98
+Alan Turing       | London   | 734.75
+Ada Lovelace      | London   | 697.49
 ```
 
 ## How the graph works

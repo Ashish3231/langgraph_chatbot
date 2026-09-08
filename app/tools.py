@@ -21,8 +21,8 @@ Two rules that apply to every tool below:
 
 import ast
 import operator
-import sqlite3
 
+import psycopg
 from langchain_core.tools import tool
 
 from app.db import connect_read_only
@@ -160,33 +160,38 @@ def web_search(query: str, max_results: int = 5) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3. Database
+# 3. Database (PostgreSQL)
 # ---------------------------------------------------------------------------
 # Two tools, deliberately kept separate:
 #
-#   database_schema  — "what tables and columns exist?"
-#   database_query   — "run this SELECT"
+#   database_schema  -- "what tables and columns exist?"
+#   database_query   -- "run this SELECT"
 #
 # The model cannot write correct SQL without knowing the schema, and a single
 # combined tool would force it to guess. With two, the natural sequence is:
 # look at the schema, then write a query against it. That splitting of a job
 # into a discoverable step and an acting step is a pattern worth reusing.
+#
+# The connection setup lives in app/db.py; here we only turn results into text.
 
 MAX_ROWS = 50  # never hand the model an unbounded result set
 
 
-def _format_rows(rows: list[sqlite3.Row]) -> str:
+def _format_rows(rows: list[dict]) -> str:
     """Render query results as an aligned plain-text table."""
     if not rows:
         return "(query returned no rows)"
 
-    # sqlite3.Row exposes the column names of the result, which may be computed
-    # ones such as "SUM(price)" that exist in no table.
-    headers = rows[0].keys()
+    # Each row is a dict keyed by column name (see `dict_row` in app/db.py).
+    # Those names may be computed ones such as "sum" that exist in no table.
+    headers = list(rows[0].keys())
 
     # Convert every value to a string once, so we can measure and print it.
     # None means SQL NULL; showing it as "NULL" is clearer than an empty gap.
-    table = [[("NULL" if value is None else str(value)) for value in row] for row in rows]
+    table = [
+        [("NULL" if value is None else str(value)) for value in row.values()]
+        for row in rows
+    ]
 
     # Column width = the longest cell in that column, header included. zip(*table)
     # transposes the table: it turns a list of rows into a list of columns.
@@ -203,40 +208,88 @@ def _format_rows(rows: list[sqlite3.Row]) -> str:
     return "\n".join([render(headers), separator, *(render(row) for row in table)])
 
 
+# Postgres describes itself through `information_schema`, a set of standard
+# views every SQL database is supposed to provide. Unlike SQLite there is no
+# stored "CREATE TABLE" text to print, so we rebuild a readable description
+# from the catalogue instead.
+COLUMNS_SQL = """
+SELECT table_name, column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'public'
+ORDER BY table_name, ordinal_position
+"""
+
+# Foreign keys are what tell the model which columns can be JOINed, so they are
+# worth including. This walks the constraint catalogue: each FOREIGN KEY
+# constraint is joined to the columns on both sides of the relationship.
+FOREIGN_KEYS_SQL = """
+SELECT tc.table_name,
+       kcu.column_name,
+       ccu.table_name  AS foreign_table,
+       ccu.column_name AS foreign_column
+FROM information_schema.table_constraints AS tc
+JOIN information_schema.key_column_usage AS kcu
+     ON kcu.constraint_name = tc.constraint_name
+JOIN information_schema.constraint_column_usage AS ccu
+     ON ccu.constraint_name = tc.constraint_name
+WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+ORDER BY tc.table_name, kcu.column_name
+"""
+
+
 @tool
 def database_schema() -> str:
-    """List the tables and columns in the database.
+    """List the tables, columns and foreign keys in the PostgreSQL database.
 
-    Call this before `database_query` so you know what you can select from.
+    Call this before `database_query` so you know what you can select from and
+    which columns can be joined.
     """
     try:
         connection = connect_read_only()
-    except sqlite3.Error as exc:
-        return f"Error opening the database: {exc}"
+    except psycopg.Error as exc:
+        return f"Error connecting to the database: {exc}"
 
     try:
-        # sqlite_master is SQLite's built-in catalogue of everything in the
-        # database; its `sql` column holds the original CREATE TABLE text.
-        rows = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
-        ).fetchall()
+        columns = connection.execute(COLUMNS_SQL).fetchall()
+        foreign_keys = connection.execute(FOREIGN_KEYS_SQL).fetchall()
+    except psycopg.Error as exc:
+        return f"Error reading the schema: {exc}"
     finally:
         # `finally` runs whether or not the code above raised, so the connection
         # is always closed.
         connection.close()
 
-    if not rows:
+    if not columns:
         return "The database contains no tables."
-    return "\n\n".join(row["sql"] for row in rows)
+
+    # Group the flat list of columns by table name. `setdefault` returns the
+    # list already stored under that key, creating an empty one the first time.
+    tables: dict[str, list[str]] = {}
+    for column in columns:
+        nullable = "" if column["is_nullable"] == "YES" else " NOT NULL"
+        tables.setdefault(column["table_name"], []).append(
+            f"  {column['column_name']} {column['data_type']}{nullable}"
+        )
+
+    blocks = [f"{name}\n" + "\n".join(lines) for name, lines in tables.items()]
+
+    if foreign_keys:
+        links = [
+            f"  {fk['table_name']}.{fk['column_name']}"
+            f" -> {fk['foreign_table']}.{fk['foreign_column']}"
+            for fk in foreign_keys
+        ]
+        blocks.append("foreign keys\n" + "\n".join(links))
+
+    return "\n\n".join(blocks)
 
 
 @tool
 def database_query(sql: str) -> str:
-    """Run a read-only SQL SELECT against the database and return the rows.
+    """Run a read-only SQL SELECT against the PostgreSQL database.
 
-    SQLite syntax. Only SELECT (or WITH ... SELECT) statements are allowed, one
-    at a time. Call `database_schema` first if you are unsure of the tables.
+    PostgreSQL syntax. Only SELECT (or WITH ... SELECT) statements are allowed,
+    one at a time. Call `database_schema` first if you are unsure of the tables.
     Results are capped at 50 rows, so add your own LIMIT or an aggregate such as
     COUNT(*) when a query could match many rows.
     """
@@ -253,17 +306,17 @@ def database_query(sql: str) -> str:
 
     try:
         connection = connect_read_only()
-    except sqlite3.Error as exc:
-        return f"Error opening the database: {exc}"
+    except psycopg.Error as exc:
+        return f"Error connecting to the database: {exc}"
 
     try:
         # Read one row past the cap so we can tell "exactly 50" from "more
         # than 50" and say so.
         rows = connection.execute(statement).fetchmany(MAX_ROWS + 1)
-    except sqlite3.Error as exc:
+    except psycopg.Error as exc:
         # The real protection is the read-only connection in app/db.py: even a
-        # DELETE that slipped past the checks above fails here rather than
-        # changing data. The checks exist to give a clearer message.
+        # DELETE that slipped past the checks above is refused by Postgres
+        # itself rather than changing data. The checks exist for clearer errors.
         return f"Error running query: {exc}"
     finally:
         connection.close()

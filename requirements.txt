@@ -2,3 +2,4 @@ langgraph
 langchain-openai
 python-dotenv
 ddgs
+psycopg[binary]
