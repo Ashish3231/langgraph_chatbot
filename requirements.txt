@@ -3,3 +3,6 @@ langchain-openai
 python-dotenv
 ddgs
 psycopg[binary]
+langchain-text-splitters
+pypdf
+langchain-google-genai

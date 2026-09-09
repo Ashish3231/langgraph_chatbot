@@ -1,6 +1,8 @@
 # LangGraph Agent
 
-A minimal LangGraph project: a tool-calling agent backed by an OpenAI model.
+A minimal LangGraph project: a tool-calling agent backed by an OpenAI model. It
+can do arithmetic, search the web, query a PostgreSQL database, and answer
+questions about your own documents using a vector search.
 
 ## Setup
 
@@ -10,17 +12,34 @@ python3 -m venv .venv
 cp .env.example .env   # then add your OPENAI_API_KEY
 ```
 
-The database tools need a running PostgreSQL server. On macOS:
+Two keys: `OPENAI_API_KEY` for the chat model, and `HF_TOKEN` for the document
+embeddings (free — create one at
+[huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), "Read"
+access is enough). Web search needs none; it uses DuckDuckGo.
+
+The database and document tools need a running PostgreSQL server with the
+[pgvector](https://github.com/pgvector/pgvector) extension available. On macOS:
 
 ```bash
-brew install postgresql@17
+brew install postgresql@17 pgvector
 brew services start postgresql@17
 .venv/bin/python -m app.db      # creates the database, tables and sample rows
 ```
 
 That last command is optional — the tools run it themselves on first use. The
-default connection URL is `postgresql://localhost/langgraph_demo`; set
-`DATABASE_URL` in `.env` to point at a different server.
+default connection URL is
+`postgresql://postgres:postgres@localhost:5432/chatbot`; set `DATABASE_URL` in
+`.env` to point at a different server.
+
+To load the sample documents into the vector database:
+
+```bash
+.venv/bin/python -m app.loader             # loads ./documents
+.venv/bin/python -m app.loader my/notes    # or any other folder or file
+```
+
+Loading sends each chunk to Hugging Face to be embedded, so a big folder takes
+a moment.
 
 `.env` is loaded automatically on import (see [app/__init__.py](app/__init__.py)),
 so there is no need to `export` anything.
@@ -37,8 +56,11 @@ so there is no need to `export` anything.
 | File | Purpose |
 |---|---|
 | [app/state.py](app/state.py) | `AgentState` — the state passed between nodes |
-| [app/tools.py](app/tools.py) | Tool definitions — calculator, web search, database |
+| [app/tools.py](app/tools.py) | Tool definitions — calculator, web search, database, documents |
 | [app/db.py](app/db.py) | PostgreSQL connection + the sample schema and rows |
+| [app/vectorstore.py](app/vectorstore.py) | pgvector table, embeddings and similarity search |
+| [app/loader.py](app/loader.py) | Reads files from disk, chunks them, stores them |
+| [documents/](documents/) | Sample files to load — drop your own in here |
 | [app/graph.py](app/graph.py) | Graph wiring and the compiled `graph` object |
 | [app/main.py](app/main.py) | CLI entry point |
 | [app/examples/](app/examples/) | Standalone graph examples (no API key needed) |
@@ -58,6 +80,7 @@ it** — so the docstring is part of the program, not just a comment.
 | `web_search` | `query`, `max_results` | DuckDuckGo search — no API key needed |
 | `database_schema` | — | Lists the tables, columns and foreign keys |
 | `database_query` | `sql` | Runs a read-only `SELECT` against PostgreSQL |
+| `search_documents` | `query`, `max_results` | Finds passages in your loaded documents by meaning |
 
 Every tool returns a **string** (the result is fed back to the model as text)
 and never raises — each one catches its own errors and returns a readable
@@ -106,13 +129,13 @@ tool would force it to guess. Splitting a job into a *discovery* step and an
 model cannot see.
 
 The data lives in [app/db.py](app/db.py): three tables (`customers`, `products`,
-`orders`) in a PostgreSQL database named `langgraph_demo`. Postgres is a
+`orders`) in a PostgreSQL database named `chatbot`. Postgres is a
 **server**, not a file — it runs as its own process and you reach it over a
 connection URL:
 
 ```
 postgresql://user:password@host:port/database_name
-postgresql://localhost/langgraph_demo      <- the default here
+postgresql://postgres:postgres@localhost:5432/chatbot    <- the default here
 ```
 
 `ensure_database()` creates the database, the tables and the sample rows if they
@@ -161,6 +184,71 @@ name              | city     | spent
 Linus Torvalds    | Portland | 878.98
 Alan Turing       | London   | 734.75
 Ada Lovelace      | London   | 697.49
+```
+
+### Documents (vector search)
+
+`database_query` answers questions about rows and numbers. `search_documents`
+answers questions about **prose** — whatever you loaded from disk. This is the
+"R" in RAG (retrieval-augmented generation): rather than hoping the model
+memorised your files, the agent fetches the few paragraphs that are actually
+relevant and reads them before answering.
+
+A keyword search only finds the words you typed. A **vector search** finds text
+that *means* the same thing, so "how much time off do I get?" matches a
+paragraph that only ever says "annual leave". Three steps make that work:
+
+1. An **embedding model** turns a piece of text into a list of 384 numbers.
+   Texts about similar things get similar numbers. We use
+   `sentence-transformers/all-MiniLM-L6-v2` from Hugging Face, called through
+   their hosted Inference API — so nothing heavyweight is installed locally, but
+   loading and searching both need a network connection and `HF_TOKEN`.
+2. Those vectors are stored in Postgres in a real `vector(384)` column, which
+   the **pgvector** extension adds.
+3. To answer a question we embed the question the same way and ask Postgres for
+   the rows whose vectors are closest to it.
+
+"Closest" is cosine distance, written `<=>` in pgvector — `0` means identical
+direction, `1` means unrelated — so similarity is `1 - distance`:
+
+```sql
+SELECT source, content, 1 - (embedding <=> %(query)s::vector) AS similarity
+FROM documents
+ORDER BY embedding <=> %(query)s::vector
+LIMIT 4
+```
+
+The `ORDER BY` is what uses the HNSW index; without one, Postgres compares the
+question against every row in the table.
+
+Vectors from two different embedding models are not comparable, so the model
+name and the column width have to agree. Change `EMBEDDING_MODEL` in
+[app/vectorstore.py](app/vectorstore.py) and the table is dropped and rebuilt
+the next time you run the loader, with a message saying so — set
+`EMBEDDING_DIMENSIONS` to match the new model (768 for `all-mpnet-base-v2`, for
+example) or Postgres will reject the vectors.
+
+**Loading** ([app/loader.py](app/loader.py)) is read → split → store. Files are
+cut into ~1000-character chunks with a 150-character overlap, because the agent
+should be handed a couple of relevant paragraphs rather than fifty pages — and
+because the embedding of a whole document is an average of everything in it,
+which is fuzzy and matches nothing well. The overlap keeps a sentence that falls
+on a boundary readable in at least one chunk.
+
+`.txt`, `.md` and `.pdf` are supported. Re-loading a file you already loaded is
+safe: a `UNIQUE (source, chunk_index)` constraint plus a delete-then-insert in
+one transaction replaces its old chunks instead of storing a second copy.
+
+Search results below a similarity of `0.2` are dropped — pgvector always returns
+the *nearest* rows, even when the nearest thing in the database is not close at
+all, so without a floor an unrelated question gets confident nonsense back.
+
+```
+.venv/bin/python -m app.main "how many days of paid time off do employees get?"
+
+Employees receive 28 days of paid annual leave per year, plus public holidays.
+Up to 5 unused days may be carried into the following year, and any days beyond
+that are lost on December 31st. This information is from the company handbook.
 ```
 
 ## How the graph works
@@ -258,7 +346,8 @@ def reverse(text: str) -> str:
     """Reverse a string."""
     return text[::-1]
 
-TOOLS = [calculator, word_count, web_search, database_schema, database_query, reverse]
+TOOLS = [calculator, word_count, web_search, database_schema, database_query,
+         search_documents, reverse]
 ```
 
 The docstring is the description the model sees, so keep it accurate. Both the

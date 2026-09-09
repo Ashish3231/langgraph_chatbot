@@ -28,7 +28,9 @@ SYSTEM_PROMPT = (
     "- web_search for anything current, or any fact you are unsure of. Cite the "
     "URLs you used.\n"
     "- database_schema then database_query for questions about customers, "
-    "products or orders. Always read the schema before writing SQL."
+    "products or orders. Always read the schema before writing SQL.\n"
+    "- search_documents for anything that might be in the user's own loaded "
+    "files. Prefer it over web_search, quote what you find, and name the file."
 )
 
 
@@ -45,6 +47,7 @@ def build_graph(checkpointer=None):
     model = build_model()
 
     def agent(state: AgentState) -> dict:
+        # print(f"  state[messages]-------------{state['messages']}")
         response = model.invoke([SystemMessage(SYSTEM_PROMPT)] + state["messages"])
         return {"messages": [response]}
 

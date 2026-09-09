@@ -26,6 +26,7 @@ import psycopg
 from langchain_core.tools import tool
 
 from app.db import connect_read_only
+from app.vectorstore import search as search_documents_by_meaning
 
 # ddgs (the DuckDuckGo search client) is an optional dependency. Importing it
 # inside a try/except means the rest of the app still works if it is missing;
@@ -328,6 +329,68 @@ def database_query(sql: str) -> str:
     return output
 
 
+# ---------------------------------------------------------------------------
+# 4. Document search (vector similarity)
+# ---------------------------------------------------------------------------
+# `database_query` answers questions about rows and numbers. This tool answers
+# questions about *prose* — whatever text you loaded with `python -m app.loader`.
+#
+# It is the "R" in RAG (retrieval-augmented generation): instead of hoping the
+# model memorised your documents, we fetch the few paragraphs that are actually
+# relevant and let it read them before answering. app/vectorstore.py explains
+# how the matching works.
+
+# Chunks below this similarity are usually about something else entirely.
+# 0 = unrelated, 1 = identical meaning. 0.2 is a deliberately loose floor: it
+# drops obvious noise without hiding a weak-but-useful match.
+MIN_SIMILARITY = 0.2
+
+
+@tool
+def search_documents(query: str, max_results: int = 4) -> str:
+    """Search the loaded documents for passages related to a question.
+
+    Use this for anything that might be covered by the user's own files
+    (handbooks, notes, policies, manuals) before falling back to `web_search`.
+    Quote the passages you use and mention which file they came from.
+    """
+    max_results = max(1, min(max_results, 10))
+
+    try:
+        rows = search_documents_by_meaning(query, limit=max_results)
+    except psycopg.errors.UndefinedTable:
+        # The documents table only exists once something has been loaded.
+        return "Error: no documents have been loaded yet (run `python -m app.loader`)."
+    except psycopg.Error as exc:
+        return f"Error searching documents: {exc}"
+    except Exception as exc:
+        # Embedding the query is a network call to Gemini, which can fail too
+        # (a missing or rejected GOOGLE_API_KEY shows up here).
+        return f"Error embedding the query: {exc}"
+
+    # Drop the weak matches. pgvector always returns the *nearest* rows, even
+    # when the nearest thing in the database is not close at all.
+    rows = [row for row in rows if row["similarity"] >= MIN_SIMILARITY]
+    if not rows:
+        return f"No relevant passages found for {query!r}."
+
+    lines = [f"Top {len(rows)} passages for {query!r}:"]
+    for position, row in enumerate(rows, start=1):
+        # :.2f prints the score with two decimal places.
+        lines.append(
+            f"\n{position}. {row['source']} (chunk {row['chunk_index']}, "
+            f"similarity {row['similarity']:.2f})\n{row['content']}"
+        )
+    return "\n".join(lines)
+
+
 # Both the model binding and the ToolNode in app/graph.py read this list, so a
 # tool added here becomes available to the agent with no other changes.
-TOOLS = [calculator, word_count, web_search, database_schema, database_query]
+TOOLS = [
+    calculator,
+    word_count,
+    web_search,
+    database_schema,
+    database_query,
+    search_documents,
+]

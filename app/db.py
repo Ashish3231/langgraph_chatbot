@@ -11,7 +11,7 @@ gives us three things a single-file database cannot:
 Connecting is done with a **connection URL**:
 
     postgresql://user:password@host:port/database_name
-    postgresql://localhost/langgraph_demo      <- what we use by default
+    postgresql://postgres:postgres@localhost:5432/chatbot   <- our default
 
 Set `DATABASE_URL` in your .env to point somewhere else.
 
@@ -28,7 +28,9 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 # The database we read. Override in .env to use a different server.
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/langgraph_demo")
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/chatbot"
+)
 
 # A query written by a language model could accidentally be an expensive one, so
 # the server is told to abort anything still running after 10 seconds. Passing
@@ -96,8 +98,8 @@ ORDERS = [
 def _database_name() -> str:
     """Pull the database name out of DATABASE_URL.
 
-    In `postgresql://localhost/langgraph_demo` the parsed `.path` is
-    "/langgraph_demo", so we drop the leading slash.
+    In `postgresql://postgres:postgres@localhost:5432/chatbot` the parsed
+    `.path` is "/chatbot", so we drop the leading slash.
     """
     return urlsplit(DATABASE_URL).path.lstrip("/")
 
