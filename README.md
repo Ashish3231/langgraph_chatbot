@@ -49,7 +49,11 @@ so there is no need to `export` anything.
 ```bash
 .venv/bin/python -m app.main                  # interactive chat
 .venv/bin/python -m app.main "what is 17*23"  # one-shot
+.venv/bin/python -m app.main --no-stream ...  # wait for the finished answer
 ```
+
+The answer appears word by word as the model writes it, and each tool call is
+announced as it is requested — see [Streaming](#streaming).
 
 ## Layout
 
@@ -267,15 +271,86 @@ loops back so the model can read the results; otherwise the graph ends.
 State uses the `add_messages` reducer, so each node returns only the messages it
 produced and LangGraph appends them to the running conversation.
 
+## Streaming
+
+`graph.invoke(...)` returns one dict when everything has finished. On a question
+that needs two tool calls that is several seconds of nothing. `graph.stream(...)`
+returns a **generator** — a lazy sequence you loop over — that yields while the
+graph is still running. `stream_mode` decides what it yields:
+
+| `stream_mode` | Each chunk is | Use it for |
+|---|---|---|
+| `"updates"` | `{node_name: what_that_node_returned}` | progress, one node at a time |
+| `"values"` | the whole state after each step | a running snapshot |
+| `"messages"` | `(message_chunk, metadata)` — model output token by token | the typing effect |
+| `"custom"` | whatever a node wrote itself | progress from inside a slow node |
+| `"debug"` | every internal event | debugging |
+
+Pass a **list** of modes and each chunk arrives as a `(mode, chunk)` pair
+instead, so one loop can do several at once. That is what
+[app/main.py](app/main.py) does:
+
+```python
+for mode, chunk in graph.stream(
+    {"messages": [HumanMessage(text)]}, config, stream_mode=["messages", "updates"]
+):
+    if mode == "messages":
+        message, metadata = chunk
+        if metadata.get("langgraph_node") == "agent" and message.text:
+            print(message.text, end="", flush=True)   # the answer, as it is written
+    elif mode == "updates":
+        ...                                           # "the model asked for a tool"
+```
+
+```
+you> who spent the most, and on what?
+bot>
+  · database_schema()
+  · database_query(sql='SELECT c.name, SUM(o.total) ...')
+Linus Torvalds spent the most, 878.98 across three orders...
+```
+
+Two details worth knowing:
+
+- **`metadata["langgraph_node"]` matters.** Tool results are messages too, and a
+  bigger app may run several model calls (an answer, a router, a summariser)
+  in one graph. Without that filter they all land in the same stream.
+- **Nodes do not mention streaming.** [app/graph.py](app/graph.py) calls
+  `model.invoke(...)`, not `model.stream(...)`, and tokens still come through:
+  LangGraph attaches a streaming callback to model calls inside a node, and
+  LangChain chat models switch to streaming internally when they see it. Nodes
+  stay written the plain way and the *caller* decides whether to stream.
+
+A tool-calling turn produces no text of its own (only the call), so the token
+stream and the tool announcements never fight over the same line.
+
+### Progress from inside a node — `stream_mode="custom"`
+
+`updates` only fires when a node *returns*, and a node that spends ten seconds
+fetching documents has plenty to say before then. `get_stream_writer()` returns
+a function that publishes anything you hand it to the `custom` stream:
+
+```python
+from langgraph.config import get_stream_writer
+
+def retrieve(state):
+    writer = get_stream_writer()
+    for number, name in enumerate(files, start=1):
+        writer({"searched": f"{number}/{len(files)}", "file": name})
+    ...
+```
+
 ## Examples
 
-Three self-contained graphs that run without an API key — every node is a plain
-Python function, so the graph mechanics are visible on their own.
+Four self-contained graphs that run without an API key — every node is a plain
+Python function (the streaming one uses a fake model), so the graph mechanics
+are visible on their own.
 
 ```bash
 .venv/bin/python -m app.examples.simple                  # linear pipeline
 .venv/bin/python -m app.examples.branching               # conditional routing
 .venv/bin/python -m app.examples.visualize               # draw every graph
+.venv/bin/python -m app.examples.streaming               # every stream mode
 ```
 
 ### Simple state graph — [app/examples/simple.py](app/examples/simple.py)
@@ -312,6 +387,25 @@ via `.invoke({...})`, no model in the loop.
 .venv/bin/python -m app.examples.branching "how many words"     # -> analyze
 ```
 
+### Streaming — [app/examples/streaming.py](app/examples/streaming.py)
+
+```
+START ──> retrieve ──> respond ──> END
+```
+
+Every mode from [Streaming](#streaming) above, run one after another on the same
+two-node graph so the output can be compared side by side:
+
+```bash
+.venv/bin/python -m app.examples.streaming            # all of them
+.venv/bin/python -m app.examples.streaming messages   # or one: updates, values,
+                                                      # messages, custom, combined
+```
+
+`retrieve` reports progress with `get_stream_writer()`; `respond` calls a
+`GenericFakeChatModel`, which replays a canned sentence one word at a time — so
+the token streaming is real streaming, and the whole example needs no API key.
+
 ### Graph visualization — [app/examples/visualize.py](app/examples/visualize.py)
 
 Any compiled graph can draw itself via `graph.get_graph()`:
@@ -322,7 +416,7 @@ Any compiled graph can draw itself via `graph.get_graph()`:
 .venv/bin/python -m app.examples.visualize --png diagrams/     # + .png files
 ```
 
-This renders the two examples above *and* the agent graph from
+This renders the examples above *and* the agent graph from
 [app/graph.py](app/graph.py) (skipped with a note if the model client cannot be
 constructed).
 

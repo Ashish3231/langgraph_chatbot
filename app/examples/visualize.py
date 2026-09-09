@@ -13,7 +13,7 @@ attempted and skipped with a note if unavailable.
 import sys
 from pathlib import Path
 
-from app.examples import branching, simple
+from app.examples import branching, simple, streaming
 
 
 def graphs() -> dict:
@@ -22,7 +22,11 @@ def graphs() -> dict:
     `app.graph` is imported lazily: it constructs an OpenAI client at import
     time, so it is only pulled in when a key is actually configured.
     """
-    rendered = {"simple": simple.graph, "branching": branching.graph}
+    rendered = {
+        "simple": simple.graph,
+        "branching": branching.graph,
+        "streaming": streaming.graph,
+    }
     try:
         from app.graph import graph as agent_graph
     except Exception as exc:  # missing key, missing package — not fatal here
